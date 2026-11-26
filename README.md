@@ -1,4 +1,4 @@
-# Plataforma de Emissão de Reports — Logbook Clínico (Egas Moniz)
+# Plataforma de Emissão de Reports — Logbook Clínico
 
 Aplicação Streamlit para emissão automatizada dos 5 relatórios de acompanhamento do Logbook Clínico (`MIMV`, `LEV`, `LCB`) em **PDF** e **Excel (.xlsx)**.
 
