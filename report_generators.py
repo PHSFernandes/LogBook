@@ -5,6 +5,7 @@ para os 5 relatórios da Plataforma Logbook - Egas Moniz.
 """
 
 import io
+import re
 import zipfile
 from datetime import datetime, date
 import pandas as pd
@@ -15,9 +16,9 @@ from openpyxl.utils import get_column_letter
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape, portrait
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER
 
 from rules_data import (
     ALL_SPECIES,
@@ -28,8 +29,84 @@ from rules_data import (
 )
 
 # ---------------------------------------------------------------------------
-# PARSING E NORMALIZAÇÃO DOS CSVs
+# EXTRAÇÃO DE METADADOS DO NOME DO FICHEIRO E NORMALIZAÇÃO DOS CSVs
 # ---------------------------------------------------------------------------
+
+def format_subject_pt(subject: str) -> str:
+    """Converte '4th Year Logbook' -> '4º Ano', '5th Year Specialization Logbook' -> '5º Ano Specialization'."""
+    s = str(subject or "").strip()
+    s_no_lb = re.sub(r"\s*Logbook\s*$", "", s, flags=re.IGNORECASE).strip()
+    m = re.match(r"^(\d+)(?:st|nd|rd|th)\s+Year(?:\s+(.*))?$", s_no_lb, flags=re.IGNORECASE)
+    if m:
+        num = m.group(1)
+        extra = (m.group(2) or "").strip()
+        return f"{num}º Ano {extra}".strip()
+    return s_no_lb or s
+
+
+def format_course_year_label(curso: str, subjects=None) -> str:
+    """Retorna 'MIMV - 4º Ano' quando houver ano(s) selecionado(s), ou apenas 'MIMV' caso contrário."""
+    if not subjects:
+        return str(curso).strip()
+    if isinstance(subjects, str):
+        subj_list = [subjects] if subjects.strip() else []
+    else:
+        subj_list = [str(x).strip() for x in subjects if str(x).strip()]
+    if not subj_list:
+        return str(curso).strip()
+    formatted = [format_subject_pt(x) for x in subj_list]
+    return f"{curso} - {', '.join(formatted)}"
+
+
+def extract_date_from_filename(filename: str):
+    """
+    Extrai a data no formato dd_mm_aaaa (ou dd-mm-aaaa como contingência) do nome do ficheiro.
+    Retorna (date_obj | None, str_dd_mm_yyyy | None).
+    """
+    m = re.search(r"(\d{2})[_-](\d{2})[_-](\d{4})", str(filename))
+    if not m:
+        return None, None
+    day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        dt_obj = date(year, month, day)
+        return dt_obj, dt_obj.strftime("%d/%m/%Y")
+    except ValueError:
+        return None, None
+
+
+def build_source_note(df_subset: pd.DataFrame) -> str:
+    """
+    Gera a nota padrão de rastreabilidade do ficheiro e data de extração:
+    'Report gerado com dados obtidos do LogBook em dd/mm/aaaa (Ficheiro: ...).'
+    """
+    if df_subset is None or df_subset.empty or "Source_File" not in df_subset.columns:
+        return "Report gerado com dados obtidos do LogBook."
+
+    pairs = (
+        df_subset[["Source_File", "Extraction_Date_Str"]]
+        .drop_duplicates()
+        .to_records(index=False)
+    )
+    entries = []
+    dates_found = []
+    for fname, dstr in pairs:
+        if dstr and str(dstr) != "None" and str(dstr) != "nan":
+            dates_found.append(str(dstr))
+            entries.append(f"{fname} ({dstr})")
+        else:
+            entries.append(f"{fname}")
+
+    unique_dates = sorted(set(dates_found), key=lambda s: datetime.strptime(s, "%d/%m/%Y"))
+    files_str = "; ".join(entries)
+
+    if len(unique_dates) == 1:
+        return f"Report gerado com dados obtidos do LogBook em {unique_dates[0]} (Ficheiro: {files_str})."
+    elif len(unique_dates) > 1:
+        dates_joined = ", ".join(unique_dates[:-1]) + f" e {unique_dates[-1]}"
+        return f"Report gerado com dados obtidos do LogBook em {dates_joined} (Ficheiros: {files_str})."
+    else:
+        return f"Report gerado com dados obtidos do LogBook (Ficheiro: {files_str})."
+
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -41,7 +118,7 @@ def parse_dt_series(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce", utc=True).dt.tz_localize(None)
 
 
-def prepare_clinical_activities(df_raw: pd.DataFrame, curso_tag: str) -> pd.DataFrame:
+def prepare_clinical_activities(df_raw: pd.DataFrame, curso_tag: str, source_filename: str = "") -> pd.DataFrame:
     """
     Normaliza clinical-activities:
     - Deduplica por 'Código do Log' (mantendo o registro mais recente)
@@ -49,7 +126,11 @@ def prepare_clinical_activities(df_raw: pd.DataFrame, curso_tag: str) -> pd.Data
     - Explode alunos (Criado por quando STUDENT; Nome do estudante separado por vírgula quando TEACHER/direct_attribution)
     """
     df = clean_columns(df_raw)
+    ext_dt, ext_str = extract_date_from_filename(source_filename)
     df["Curso_Tag"] = curso_tag
+    df["Source_File"] = source_filename
+    df["Extraction_Date"] = ext_dt
+    df["Extraction_Date_Str"] = ext_str
 
     if "Atualização da Aprovação" in df.columns:
         df["_upd"] = parse_dt_series(df["Atualização da Aprovação"])
@@ -69,12 +150,10 @@ def prepare_clinical_activities(df_raw: pd.DataFrame, curso_tag: str) -> pd.Data
 
     df["Data_Atividade_Dt"] = parse_dt_series(df["Data da Atividade"]).dt.date
 
-    # Identificação e explosão de alunos
     def extract_students(row):
         nome_est = str(row.get("Nome do estudante", "") or "").strip()
         if nome_est and nome_est.lower() != "nan":
             parts = [p.strip() for p in nome_est.split(",") if p.strip()]
-            # Ignorar placeholder genérico 'Student' se houver criador real
             parts = [p for p in parts if p.lower() != "student"]
             if parts:
                 return parts
@@ -88,7 +167,6 @@ def prepare_clinical_activities(df_raw: pd.DataFrame, curso_tag: str) -> pd.Data
     df = df[df["Lista_Alunos"].map(len) > 0].copy()
     df_exp = df.explode("Lista_Alunos").rename(columns={"Lista_Alunos": "Aluno"})
 
-    # Espécies (pode conter múltiplos valores separados por vírgula)
     def parse_species_cell(val):
         s = str(val or "").strip()
         if not s or s.lower() == "nan":
@@ -99,31 +177,56 @@ def prepare_clinical_activities(df_raw: pd.DataFrame, curso_tag: str) -> pd.Data
     return df_exp
 
 
-def prepare_approval_control(df_raw: pd.DataFrame, curso_tag: str) -> pd.DataFrame:
+def prepare_approval_control(df_raw: pd.DataFrame, curso_tag: str, source_filename: str = "") -> pd.DataFrame:
     """
-    Normaliza approval-control:
-    - Filtra Estado do Log == 'AWAITING_APPROVAL' e Aprovado vazio (NaN)
-    - Mantém Perfil do Aprovador in ('MONITOR', 'TEACHER')
+    Normaliza approval-control eliminando falsos positivos e dupla contagem:
+    1. Exige Estado do Log == 'AWAITING_APPROVAL' (exclui APPROVED, REJECTED, FILLING).
+    2. Avalia o fluxo por Código do Log:
+       - Se existir linha MONITOR com Aprovado vazio (NaN): pendência exclusiva do MONITOR.
+       - Se NÃO existir MONITOR (sem_monitor) OU se o MONITOR já tiver avaliado (Aprovado == 1.0 ou 0.0,
+         equivalente a conform_monitor / non_conform_monitor) E o TEACHER tiver Aprovado vazio (NaN):
+         pendência exclusiva do TEACHER.
     """
     df = clean_columns(df_raw)
+    ext_dt, ext_str = extract_date_from_filename(source_filename)
     df["Curso_Tag"] = curso_tag
+    df["Source_File"] = source_filename
+    df["Extraction_Date"] = ext_dt
+    df["Extraction_Date_Str"] = ext_str
 
     estado = df["Estado do Log"].fillna("").astype(str).str.strip().str.upper()
-    df = df[estado == "AWAITING_APPROVAL"].copy()
-    df = df[df["Aprovado"].isna()].copy()
+    df_aw = df[estado == "AWAITING_APPROVAL"].copy()
+    if df_aw.empty:
+        return pd.DataFrame(columns=list(df.columns) + ["Perfil_Norm", "Nome_Aprovador_Clean", "Solicitado_Dt"])
 
-    df["Perfil_Norm"] = df["Perfil do Aprovador"].fillna("").astype(str).str.strip().str.upper()
-    df = df[df["Perfil_Norm"].isin(["MONITOR", "TEACHER"])].copy()
+    df_aw["Perfil_Norm"] = df_aw["Perfil do Aprovador"].fillna("").astype(str).str.strip().str.upper()
+    df_aw["Nome_Aprovador_Clean"] = df_aw["Nome do Aprovador"].fillna("Sem Nome Atribuído").astype(str).str.strip()
+    df_aw["Solicitado_Dt"] = parse_dt_series(df_aw["Solicitado para Aprovação em"])
 
-    df["Nome_Aprovador_Clean"] = df["Nome do Aprovador"].fillna("Sem Nome Atribuído").astype(str).str.strip()
-    df["Solicitado_Dt"] = parse_dt_series(df["Solicitado para Aprovação em"])
-    return df
+    # Logs onde há monitor atribuído e ainda sem parecer (Aprovado isna)
+    mon_rows = df_aw[df_aw["Perfil_Norm"] == "MONITOR"].copy()
+    mon_pending_rows = mon_rows[mon_rows["Aprovado"].isna()].copy()
+    logs_blocked_by_monitor = set(mon_pending_rows["Código do Log"].dropna().unique())
+
+    # Logs pendentes com docente: Estado == AWAITING_APPROVAL, Aprovado docente vazio,
+    # e NÃO bloqueados na fila do monitor (ou seja: sem monitor OU monitor já validou 1.0/0.0)
+    tea_rows = df_aw[df_aw["Perfil_Norm"] == "TEACHER"].copy()
+    tea_pending_rows = tea_rows[
+        tea_rows["Aprovado"].isna() & (~tea_rows["Código do Log"].isin(logs_blocked_by_monitor))
+    ].copy()
+
+    return pd.concat([mon_pending_rows, tea_pending_rows], ignore_index=True)
 
 
-def prepare_subcompetences(df_raw: pd.DataFrame, curso_tag: str) -> pd.DataFrame:
+def prepare_subcompetences(df_raw: pd.DataFrame, curso_tag: str, source_filename: str = "") -> pd.DataFrame:
     """Normaliza sub-competences-student-subject."""
     df = clean_columns(df_raw)
+    ext_dt, ext_str = extract_date_from_filename(source_filename)
     df["Curso_Tag"] = curso_tag
+    df["Source_File"] = source_filename
+    df["Extraction_Date"] = ext_dt
+    df["Extraction_Date_Str"] = ext_str
+
     df["Nome_Clean"] = df["Nome"].fillna("").astype(str).str.strip()
     df["Codigo_Clean"] = df["Código da Subcompetência"].fillna("").astype(str).str.strip()
     df["Especie_Clean"] = df["Espécie"].fillna("").astype(str).str.strip()
@@ -159,14 +262,12 @@ def build_report_1_uc(
     if selected_activities:
         df = df[df["Atividade"].isin(selected_activities)]
 
-    # Explode espécies para contar corretamente registros multi-espécie
     df_sp = df.explode("Lista_Especies").rename(columns={"Lista_Especies": "Especie_Item"})
     df_sp = df_sp[df_sp["Especie_Item"].notna() & (df_sp["Especie_Item"] != "")]
 
     if selected_species:
         df_sp = df_sp[df_sp["Especie_Item"].isin(selected_species)]
 
-    # Lista base de alunos ativos no filtro (ou na turma se subject_filter definido)
     if subject_filter:
         all_students = sorted(df_act_exp[df_act_exp["Subject"].isin(subject_filter)]["Aluno"].unique())
     else:
@@ -194,20 +295,22 @@ def build_report_1_uc(
     res["Animais de Cia"] = res[companion_cols].sum(axis=1) if companion_cols else 0
     res["Equinos"] = res[equine_cols].sum(axis=1) if equine_cols else 0
 
-    # Linha de Total Geral no rodapé
     totals_row = {"Alunos": "TOTAL GERAL"}
     for c in cols_species + ["Totais", "Espécie Pecuária", "Animais de Cia", "Equinos"]:
         totals_row[c] = int(res[c].sum())
     res = pd.concat([res, pd.DataFrame([totals_row])], ignore_index=True)
 
+    curso_tag_val = str(df_act_exp["Curso_Tag"].iloc[0]) if not df_act_exp.empty else ""
     meta = {
         "uc_name": uc_name,
+        "curso_header": format_course_year_label(curso_tag_val, subject_filter),
         "dt_start": dt_start.strftime("%d/%m/%Y"),
         "dt_end": dt_end.strftime("%d/%m/%Y"),
         "activities": ", ".join(selected_activities) if selected_activities else "Todas",
         "species": ", ".join(selected_species) if selected_species else "Todas",
-        "logs_approved": int((df["Status_Report"] == "Approved").nunique()) if not df.empty else 0,
-        "logs_da": int((df["Status_Report"] == "Approved como DA").nunique()) if not df.empty else 0,
+        "logs_approved": int(df[df["Status_Report"] == "Approved"]["Código do Log"].nunique()) if not df.empty else 0,
+        "logs_da": int(df[df["Status_Report"] == "Approved como DA"]["Código do Log"].nunique()) if not df.empty else 0,
+        "source_note": build_source_note(df_act_exp),
     }
     return res, meta
 
@@ -217,22 +320,22 @@ def build_report_2_3_delays(
     perfil: str,
     ref_date: date,
     grace_days: int = 3,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, str]:
     """
     Calcula pendentes com 0 dias (todos AWAITING_APPROVAL sem decisão)
-    e com carência (> grace_days), além do maior atraso em dias à data de emissão.
-    perfil: 'MONITOR' (Report 2) ou 'TEACHER' (Report 3).
+    e com carência (> grace_days), além do maior atraso em dias à data de referência.
+    Retorna (DataFrame, source_note).
     """
+    source_note = build_source_note(df_app_all)
     df = df_app_all[df_app_all["Perfil_Norm"] == perfil].copy()
     if df.empty:
         return pd.DataFrame(columns=[
             "Nome", "Cursos", "Pendentes (0 dias)", f"Em Atraso (> {grace_days} dias)", "Maior Atraso (dias)"
-        ])
+        ]), source_note
 
     ref_ts = pd.Timestamp(datetime.combine(ref_date, datetime.max.time()))
     df["Dias_Atraso"] = (ref_ts - df["Solicitado_Dt"]).dt.days.clip(lower=0).fillna(0).astype(int)
 
-    # Deduplicar por (Nome_Aprovador_Clean, Código do Log) caso apareça repetido
     df_u = df.drop_duplicates(subset=["Nome_Aprovador_Clean", "Código do Log"]).copy()
     df_u["Atraso_Carencia"] = (df_u["Dias_Atraso"] > grace_days).astype(int)
 
@@ -255,7 +358,6 @@ def build_report_2_3_delays(
         ascending=[False, False, False, True],
     ).reset_index(drop=True)
 
-    # Linha de Total Geral
     total_row = pd.DataFrame([{
         "Nome": "TOTAL GERAL",
         "Cursos": "-",
@@ -263,7 +365,7 @@ def build_report_2_3_delays(
         f"Em Atraso (> {grace_days} dias)": int(agg[f"Em Atraso (> {grace_days} dias)"].sum()),
         "Maior Atraso (dias)": int(agg["Maior Atraso (dias)"].max()) if not agg.empty else 0,
     }])
-    return pd.concat([agg, total_row], ignore_index=True)
+    return pd.concat([agg, total_row], ignore_index=True), source_note
 
 
 def evaluate_student_competences(
@@ -273,9 +375,6 @@ def evaluate_student_competences(
 ) -> dict:
     """
     Avalia cada aluno contra todas as regras ativas do catálogo.
-    Retorna dicionário:
-      student_name -> DataFrame com colunas:
-      [Código, Subcompetência, Regra Espécies, Mínimo Exigido, Obtido Total, Detalhe por Bloco, ...Espécies..., Status]
     """
     active_rules = rules_df[rules_df["Estado"] == "Ativa"].copy()
     parsed_rules = []
@@ -291,7 +390,6 @@ def evaluate_student_competences(
             "total_min": total_min,
         })
 
-    # Contagem pré-agregada: (Nome_Clean, Codigo_Clean, Especie_Clean) -> count
     if df_sub_filtered.empty:
         counts_map = {}
     else:
@@ -306,7 +404,6 @@ def evaluate_student_competences(
             sp_counts = {sp: counts_map.get((st, code, sp), 0) for sp in ALL_SPECIES}
             total_obt = sum(sp_counts.values())
 
-            # Avalia cada bloco de espécies (ex: D/C >= 3 E R/ExB/... >= 3)
             block_statuses = []
             all_blocks_ok = True
             for b in pr["blocks"]:
@@ -340,8 +437,7 @@ def build_report_5_managerial(
     subject: str,
 ) -> pd.DataFrame:
     """
-    Consolida para todos os alunos do curso/ano quais competências estão abaixo do mínimo,
-    contando quantos alunos não atingiram e percentual de pendência.
+    Consolida para todos os alunos do curso/ano quais competências estão abaixo do mínimo.
     """
     total_students = len(results_by_student)
     if total_students == 0:
@@ -388,7 +484,7 @@ def build_report_5_managerial(
 # EXPORTAÇÃO EXCEL (.XLSX)
 # ---------------------------------------------------------------------------
 
-def _style_worksheet(ws, title: str, subtitle: str, green_cols=None, highlight_red_col=None):
+def _style_worksheet(ws, title: str, subtitle: str, source_note: str = "", green_cols=None, highlight_red_col=None):
     green_cols = green_cols or set()
     navy_fill = PatternFill("solid", fgColor="1B365D")
     green_hdr_fill = PatternFill("solid", fgColor="1E6B38")
@@ -402,13 +498,15 @@ def _style_worksheet(ws, title: str, subtitle: str, green_cols=None, highlight_r
     thin_side = Side(border_style="thin", color="CBD5E1")
     border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
-    ws.insert_rows(1, 3)
+    ws.insert_rows(1, 4)
     ws["A1"] = title
     ws["A1"].font = Font(name="Calibri", size=14, bold=True, color="1B365D")
     ws["A2"] = subtitle
     ws["A2"].font = Font(name="Calibri", size=10, italic=True, color="475569")
+    ws["A3"] = source_note
+    ws["A3"].font = Font(name="Calibri", size=9.5, bold=True, color="1E3A8A")
 
-    header_row = 4
+    header_row = 5
     max_col = ws.max_column
     max_row = ws.max_row
 
@@ -459,17 +557,25 @@ def _style_worksheet(ws, title: str, subtitle: str, green_cols=None, highlight_r
 
 def to_excel_bytes(sheets_dict: dict, green_cols=None, highlight_red_col=None) -> bytes:
     """
-    sheets_dict: {sheet_name: (df, title, subtitle)}
+    sheets_dict: {sheet_name: (df, title, subtitle, source_note)}
     """
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    for sheet_name, (df, title, subtitle) in sheets_dict.items():
+    for sheet_name, item in sheets_dict.items():
+        if len(item) == 4:
+            df, title, subtitle, source_note = item
+        else:
+            df, title, subtitle = item
+            source_note = ""
         safe_name = str(sheet_name)[:31].replace("/", "-").replace(":", "-")
         ws = wb.create_sheet(title=safe_name)
         ws.append(list(df.columns))
         for row in df.itertuples(index=False):
             ws.append(list(row))
-        _style_worksheet(ws, title, subtitle, green_cols=green_cols, highlight_red_col=highlight_red_col)
+        _style_worksheet(
+            ws, title, subtitle, source_note=source_note,
+            green_cols=green_cols, highlight_red_col=highlight_red_col
+        )
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -488,7 +594,11 @@ def _get_pdf_styles():
     ))
     styles.add(ParagraphStyle(
         name="InstSub", fontName="Helvetica", fontSize=8.5,
-        textColor=colors.HexColor("#475569"), spaceAfter=6
+        textColor=colors.HexColor("#475569"), spaceAfter=2
+    ))
+    styles.add(ParagraphStyle(
+        name="SourceNote", fontName="Helvetica-Bold", fontSize=8,
+        textColor=colors.HexColor("#1E3A8A"), spaceAfter=6
     ))
     styles.add(ParagraphStyle(
         name="CellTxt", fontName="Helvetica", fontSize=7.5, leading=9,
@@ -532,13 +642,16 @@ def generate_pdf_report_1(df: pd.DataFrame, meta: dict, curso: str) -> bytes:
     styles = _get_pdf_styles()
     story = []
 
-    story.append(Paragraph(f"RELATÓRIO DE ATIVIDADES CLÍNICAS POR UC — {curso}", styles["InstHeader"]))
+    hdr_r1 = meta.get("curso_header") or curso
+    story.append(Paragraph(f"RELATÓRIO DE ATIVIDADES CLÍNICAS POR UC — {hdr_r1}", styles["InstHeader"]))
     story.append(Paragraph(
-        f"<b>Unidade Curricular:</b> {meta['uc_name']} &nbsp;|&nbsp; "
+        f"<b>UC de referência:</b> {meta['uc_name']} &nbsp;|&nbsp; "
         f"<b>Período:</b> {meta['dt_start']} a {meta['dt_end']} &nbsp;|&nbsp; "
         f"<b>Atividades:</b> {meta['activities']}",
         styles["InstSub"]
     ))
+    if meta.get("source_note"):
+        story.append(Paragraph(meta["source_note"], styles["SourceNote"]))
 
     green_set = set(LIVESTOCK_SPECIES + ["Espécie Pecuária"])
     cols = list(df.columns)
@@ -587,7 +700,7 @@ def generate_pdf_report_1(df: pd.DataFrame, meta: dict, curso: str) -> bytes:
     return buf.getvalue()
 
 
-def generate_pdf_report_2_3(df: pd.DataFrame, titulo: str, ref_date: date, grace_days: int) -> bytes:
+def generate_pdf_report_2_3(df: pd.DataFrame, titulo: str, ref_date: date, grace_days: int, source_note: str = "") -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=portrait(A4),
@@ -602,6 +715,8 @@ def generate_pdf_report_2_3(df: pd.DataFrame, titulo: str, ref_date: date, grace
         f"<b>Carência aplicada:</b> {grace_days} dias (todos os cursos carregados)",
         styles["InstSub"]
     ))
+    if source_note:
+        story.append(Paragraph(source_note, styles["SourceNote"]))
 
     cols = list(df.columns)
     table_data = [[Paragraph(c, styles["HdrTxt"]) for c in cols]]
@@ -648,6 +763,7 @@ def generate_pdf_report_4_student(
     curso: str,
     subject: str,
     only_below: bool,
+    source_note: str = "",
 ) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -660,13 +776,16 @@ def generate_pdf_report_4_student(
     df_view = df_st[df_st["Status"] == "Abaixo do Mínimo"].copy() if only_below else df_st.copy()
     modo_txt = "Apenas competências abaixo do mínimo" if only_below else "Todas as competências avaliadas"
 
-    story.append(Paragraph(f"RELATÓRIO INDIVIDUAL DE COMPETÊNCIAS — {curso}", styles["InstHeader"]))
+    curso_ano_4 = format_course_year_label(curso, subject)
+    story.append(Paragraph(f"RELATÓRIO INDIVIDUAL DE COMPETÊNCIAS — {curso_ano_4}", styles["InstHeader"]))
     story.append(Paragraph(
         f"<b>Estudante:</b> {student_name} &nbsp;|&nbsp; "
         f"<b>Ano / Subject:</b> {subject} &nbsp;|&nbsp; "
         f"<b>Filtro:</b> {modo_txt}",
         styles["InstSub"]
     ))
+    if source_note:
+        story.append(Paragraph(source_note, styles["SourceNote"]))
 
     if df_view.empty:
         story.append(Paragraph("Nenhuma subcompetência pendente para os filtros selecionados.", styles["CellBold"]))
@@ -698,7 +817,6 @@ def generate_pdf_report_4_student(
             table_data.append(row_cells)
 
         avail_w = landscape(A4)[0] - 18 * mm
-        # Fixed widths + species columns
         w_cod = 14 * mm
         w_desc = 64 * mm
         w_reg = 28 * mm
@@ -730,7 +848,7 @@ def generate_pdf_report_4_student(
     return buf.getvalue()
 
 
-def generate_pdf_report_5(df: pd.DataFrame, curso: str, subject: str) -> bytes:
+def generate_pdf_report_5(df: pd.DataFrame, curso: str, subject: str, source_note: str = "") -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(A4),
@@ -739,11 +857,14 @@ def generate_pdf_report_5(df: pd.DataFrame, curso: str, subject: str) -> bytes:
     styles = _get_pdf_styles()
     story = []
 
-    story.append(Paragraph(f"RELATÓRIO GERENCIAL — COMPETÊNCIAS ABAIXO DO MÍNIMO ({curso})", styles["InstHeader"]))
+    curso_ano_5 = format_course_year_label(curso, subject)
+    story.append(Paragraph(f"RELATÓRIO GERENCIAL — COMPETÊNCIAS ABAIXO DO MÍNIMO ({curso_ano_5})", styles["InstHeader"]))
     story.append(Paragraph(
         f"<b>Curso:</b> {curso} &nbsp;|&nbsp; <b>Ano / Subject:</b> {subject}",
         styles["InstSub"]
     ))
+    if source_note:
+        story.append(Paragraph(source_note, styles["SourceNote"]))
 
     cols = ["Código", "Subcompetência", "Regra Espécies", "Mínimo", "Alunos Abaixo do Mínimo", "Total Alunos", "% Abaixo do Mínimo", "Média Obtida"]
     table_data = [[Paragraph(c, styles["HdrTxt"]) for c in cols]]
