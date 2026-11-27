@@ -8,7 +8,7 @@ import io
 import os
 import json
 import zipfile
-from datetime import date, timedelta
+from datetime import date
 import pandas as pd
 import streamlit as st
 
@@ -18,6 +18,9 @@ from rules_data import (
     get_default_rules_list,
 )
 from report_generators import (
+    format_course_year_label,
+    extract_date_from_filename,
+    build_source_note,
     prepare_clinical_activities,
     prepare_approval_control,
     prepare_subcompetences,
@@ -114,8 +117,8 @@ def detect_course_from_filename(filename: str) -> str:
 # ---------------------------------------------------------------------------
 st.sidebar.title("📂 Base de Dados (CSVs)")
 st.sidebar.caption(
-    "Carregue os ficheiros CSV exportados da plataforma. "
-    "Se o nome do ficheiro contiver **MIMV**, **LEV** ou **LCB**, o curso será identificado automaticamente."
+    "Carregue os ficheiros CSV exportados da plataforma (com data `dd_mm_aaaa` no nome). "
+    "Se o nome contiver **MIMV**, **LEV** ou **LCB**, o curso será identificado automaticamente."
 )
 
 uploaded_files = st.sidebar.file_uploader(
@@ -124,7 +127,6 @@ uploaded_files = st.sidebar.file_uploader(
     accept_multiple_files=True,
 )
 
-# Armazenamento em memória dos DataFrames carregados
 act_list = []
 app_list = []
 sub_list = []
@@ -134,6 +136,7 @@ if uploaded_files:
     for up in uploaded_files:
         fname = up.name
         detected_course = detect_course_from_filename(fname)
+        _, ext_str = extract_date_from_filename(fname)
         course_choice = st.sidebar.selectbox(
             f"Curso de: {fname}",
             options=["MIMV", "LEV", "LCB"],
@@ -145,17 +148,17 @@ if uploaded_files:
             cols_clean = [str(c).replace("\ufeff", "").strip().strip('"') for c in raw_df.columns]
 
             if "Perfil do Aprovador" in cols_clean:
-                norm_df = prepare_approval_control(raw_df, course_choice)
+                norm_df = prepare_approval_control(raw_df, course_choice, source_filename=fname)
                 app_list.append(norm_df)
-                file_summary.append((fname, course_choice, "Approval Control", len(norm_df)))
+                file_summary.append((fname, course_choice, "Approval Control", len(norm_df), ext_str))
             elif "ID Case Instance" in cols_clean or "Data da Atividade" in cols_clean:
-                norm_df = prepare_clinical_activities(raw_df, course_choice)
+                norm_df = prepare_clinical_activities(raw_df, course_choice, source_filename=fname)
                 act_list.append(norm_df)
-                file_summary.append((fname, course_choice, "Clinical Activities", len(norm_df)))
+                file_summary.append((fname, course_choice, "Clinical Activities", len(norm_df), ext_str))
             elif "Código da Subcompetência" in cols_clean:
-                norm_df = prepare_subcompetences(raw_df, course_choice)
+                norm_df = prepare_subcompetences(raw_df, course_choice, source_filename=fname)
                 sub_list.append(norm_df)
-                file_summary.append((fname, course_choice, "Sub-Competences", len(norm_df)))
+                file_summary.append((fname, course_choice, "Sub-Competences", len(norm_df), ext_str))
             else:
                 st.sidebar.warning(f"Estrutura não reconhecida em: {fname}")
         except Exception as e:
@@ -168,8 +171,9 @@ df_sub_all = pd.concat(sub_list, ignore_index=True) if sub_list else pd.DataFram
 if file_summary:
     st.sidebar.markdown("---")
     st.sidebar.subheader("Ficheiros Ativos")
-    for fn, crs, tipo, cnt in file_summary:
-        st.sidebar.markdown(f"- **{crs}** | {tipo} (`{cnt}` reg.)")
+    for fn, crs, tipo, cnt, d_str in file_summary:
+        dt_tag = f" | Extraído: `{d_str}`" if d_str else ""
+        st.sidebar.markdown(f"- **{crs}** | {tipo} (`{cnt}` reg.){dt_tag}")
 
 # ---------------------------------------------------------------------------
 # PÁGINA PRINCIPAL E AVISOS METODOLÓGICOS
@@ -180,7 +184,7 @@ with st.expander("📌 Notas Metodológicas e Exceções Configuradas (Ler antes
     st.markdown(
         """
         - **Report 1 (Unidades Curriculares):** Contabiliza exclusivamente registos com estado **Approved** e atribuições diretas (**Approved como DA**), desdobrando os estudantes quando registados em grupo. Colunas destacadas a verde representam **Espécies Pecuárias** (`Swine`, `Ovine`, `Bovine`, `Goat`, `Poultry`).
-        - **Reports 2 e 3 (Monitores e Professores em Atraso):** Considera todos os cursos carregados (`MIMV`, `LEV`, `LCB`) onde `Estado do Log == AWAITING_APPROVAL` e o avaliador ainda não registou decisão. Apresenta duas métricas em paralelo: **Pendentes (0 dias)** (espelhando o dashboard da plataforma) e **Em Atraso (> 3 dias de carência)**, além do **Maior Atraso (dias)** à data de emissão.
+        - **Reports 2 e 3 (Monitores e Professores em Atraso):** Considera todos os cursos carregados (`MIMV`, `LEV`, `LCB`) onde `Estado do Log == AWAITING_APPROVAL` e o avaliador ainda não registou decisão. Usa por padrão a **data de extração do ficheiro** (`dd_mm_aaaa`) como data de referência e apresenta **Pendentes (0 dias)** vs. **Em Atraso (> 3 dias de carência)**, além do **Maior Atraso (dias)**.
         - **Reports 4 e 5 (Competências e Mínimos):** Aplicam-se as regras oficiais do catálogo a todos os anos curriculares, com as seguintes exceções definidas pela coordenação:
           1. **`2-US02` (*Echographic examination training on a phantom — Skill LAB*):** Desconsiderada da avaliação.
           2. **`3-Su12` a `3-Su17` (*Suturas / QE*):** Desconsideradas até definição específica de registo.
@@ -263,6 +267,7 @@ with tabs[0]:
                 selected_activities=sel_activities,
                 subject_filter=sel_subjects,
             )
+            st.caption(meta_uc["source_note"])
             st.markdown(
                 f"**Resumo da Extração:** `{meta_uc['logs_approved']}` logs *Approved* | "
                 f"`{meta_uc['logs_da']}` registos *Approved como DA*"
@@ -284,8 +289,9 @@ with tabs[0]:
                     {
                         "Report UC": (
                             res_uc,
-                            f"RELATÓRIO DE ATIVIDADES CLÍNICAS POR UC — {curso_r1}",
-                            f"UC: {uc_name} | Período: {meta_uc['dt_start']} a {meta_uc['dt_end']} | Atividades: {meta_uc['activities']}",
+                            f"RELATÓRIO DE ATIVIDADES CLÍNICAS POR UC — {meta_uc['curso_header']}",
+                            f"UC de referência: {uc_name} | Período: {meta_uc['dt_start']} a {meta_uc['dt_end']} | Atividades: {meta_uc['activities']}",
+                            meta_uc["source_note"],
                         )
                     },
                     green_cols=green_cols,
@@ -305,8 +311,17 @@ with tabs[1]:
     if df_app_all.empty:
         st.info("Carregue pelo menos um ficheiro **approval-control** na barra lateral.")
     else:
+        ext_dates_2 = [d for d in df_app_all["Extraction_Date"].dropna().unique()]
+        default_ref_2 = max(ext_dates_2) if ext_dates_2 else date.today()
+        files_key_2 = "_".join(sorted(df_app_all["Source_File"].unique()))
+
         c1, c2 = st.columns(2)
-        ref_dt_2 = c1.date_input("Data de referência para contagem de atraso", value=date.today(), key="r2_dt")
+        ref_dt_2 = c1.date_input(
+            "Data de referência para contagem de atraso (padrão: data de extração do ficheiro)",
+            value=default_ref_2,
+            format="DD-MM-YYYY",
+            key=f"r2_dt_{files_key_2}",
+        )
         grace_2 = c2.number_input("Dias de carência", min_value=0, max_value=30, value=3, key="r2_grace")
 
         ce1, ce2 = st.columns(2)
@@ -314,7 +329,10 @@ with tabs[1]:
         want_xlsx_2 = ce2.checkbox("Exportar Excel (.xlsx)", value=False, key="r2_xlsx")
 
         if st.button("Gerar Report 2 (Monitores)", type="primary"):
-            df_mon = build_report_2_3_delays(df_app_all, perfil="MONITOR", ref_date=ref_dt_2, grace_days=int(grace_2))
+            df_mon, src_note_2 = build_report_2_3_delays(
+                df_app_all, perfil="MONITOR", ref_date=ref_dt_2, grace_days=int(grace_2)
+            )
+            st.caption(src_note_2)
             st.dataframe(df_mon, use_container_width=True, hide_index=True)
 
             if want_pdf_2:
@@ -323,6 +341,7 @@ with tabs[1]:
                     "REPORT DE MONITORES DO HVUEM EM ATRASO",
                     ref_dt_2,
                     int(grace_2),
+                    source_note=src_note_2,
                 )
                 st.download_button(
                     "⬇️ Baixar PDF — Monitores em Atraso",
@@ -336,6 +355,7 @@ with tabs[1]:
                         df_mon,
                         "REPORT DE MONITORES DO HVUEM EM ATRASO",
                         f"Data de referência: {ref_dt_2.strftime('%d/%m/%Y')} | Carência: {int(grace_2)} dias (Todos os cursos)",
+                        src_note_2,
                     )
                 })
                 st.download_button(
@@ -353,8 +373,17 @@ with tabs[2]:
     if df_app_all.empty:
         st.info("Carregue pelo menos um ficheiro **approval-control** na barra lateral.")
     else:
+        ext_dates_3 = [d for d in df_app_all["Extraction_Date"].dropna().unique()]
+        default_ref_3 = max(ext_dates_3) if ext_dates_3 else date.today()
+        files_key_3 = "_".join(sorted(df_app_all["Source_File"].unique()))
+
         c1, c2 = st.columns(2)
-        ref_dt_3 = c1.date_input("Data de referência para contagem de atraso", value=date.today(), key="r3_dt")
+        ref_dt_3 = c1.date_input(
+            "Data de referência para contagem de atraso (padrão: data de extração do ficheiro)",
+            value=default_ref_3,
+            format="DD-MM-YYYY",
+            key=f"r3_dt_{files_key_3}",
+        )
         grace_3 = c2.number_input("Dias de carência", min_value=0, max_value=30, value=3, key="r3_grace")
 
         ce1, ce2 = st.columns(2)
@@ -362,7 +391,10 @@ with tabs[2]:
         want_xlsx_3 = ce2.checkbox("Exportar Excel (.xlsx)", value=False, key="r3_xlsx")
 
         if st.button("Gerar Report 3 (Professores)", type="primary"):
-            df_prof = build_report_2_3_delays(df_app_all, perfil="TEACHER", ref_date=ref_dt_3, grace_days=int(grace_3))
+            df_prof, src_note_3 = build_report_2_3_delays(
+                df_app_all, perfil="TEACHER", ref_date=ref_dt_3, grace_days=int(grace_3)
+            )
+            st.caption(src_note_3)
             st.dataframe(df_prof, use_container_width=True, hide_index=True)
 
             if want_pdf_3:
@@ -371,6 +403,7 @@ with tabs[2]:
                     "REPORT DE PROFESSORES EM ATRASO (LOGBOOK)",
                     ref_dt_3,
                     int(grace_3),
+                    source_note=src_note_3,
                 )
                 st.download_button(
                     "⬇️ Baixar PDF — Professores em Atraso",
@@ -384,6 +417,7 @@ with tabs[2]:
                         df_prof,
                         "REPORT DE PROFESSORES EM ATRASO (LOGBOOK)",
                         f"Data de referência: {ref_dt_3.strftime('%d/%m/%Y')} | Carência: {int(grace_3)} dias (Todos os cursos)",
+                        src_note_3,
                     )
                 })
                 st.download_button(
@@ -415,6 +449,7 @@ with tabs[3]:
             (df_sub_c4["Subject_Clean"] == subj_4) & (df_sub_c4["Origem_Clean"].isin(sel_orig_4))
         ]
         students_4 = sorted(df_sub_c4[df_sub_c4["Subject_Clean"] == subj_4]["Nome_Clean"].unique().tolist())
+        src_note_4 = build_source_note(df_sub_c4)
 
         modo_4 = st.radio(
             "Conteúdo do relatório por aluno:",
@@ -445,6 +480,7 @@ with tabs[3]:
                 df_preview = eval_dict[first_st]
                 if only_below_4:
                     df_preview = df_preview[df_preview["Status"] == "Abaixo do Mínimo"]
+                st.caption(src_note_4)
                 st.caption(f"Pré-visualização: **{first_st}** ({len(df_preview)} linhas)")
                 st.dataframe(df_preview, use_container_width=True, hide_index=True)
 
@@ -452,7 +488,7 @@ with tabs[3]:
                     if len(target_students_4) == 1:
                         st_single = target_students_4[0]
                         pdf_single = generate_pdf_report_4_student(
-                            st_single, eval_dict[st_single], curso_4, subj_4, only_below_4
+                            st_single, eval_dict[st_single], curso_4, subj_4, only_below_4, source_note=src_note_4
                         )
                         st.download_button(
                             f"⬇️ Baixar PDF — {st_single}",
@@ -465,7 +501,7 @@ with tabs[3]:
                         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
                             for st_name in target_students_4:
                                 pdf_st = generate_pdf_report_4_student(
-                                    st_name, eval_dict[st_name], curso_4, subj_4, only_below_4
+                                    st_name, eval_dict[st_name], curso_4, subj_4, only_below_4, source_note=src_note_4
                                 )
                                 safe_st = st_name.replace(" ", "_").replace("/", "-")
                                 zf.writestr(f"{curso_4}_{subj_4}_{safe_st}.pdf", pdf_st)
@@ -484,8 +520,9 @@ with tabs[3]:
                             df_s = df_s[df_s["Status"] == "Abaixo do Mínimo"]
                         sheets[st_name] = (
                             df_s,
-                            f"COMPETÊNCIAS INDIVIDUAIS — {st_name}",
+                            f"COMPETÊNCIAS INDIVIDUAIS ({format_course_year_label(curso_4, subj_4)}) — {st_name}",
                             f"Curso: {curso_4} | Ano: {subj_4} | Filtro: {modo_4}",
+                            src_note_4,
                         )
                     xlsx_b4 = to_excel_bytes(sheets, highlight_red_col="Status")
                     st.download_button(
@@ -510,6 +547,7 @@ with tabs[4]:
         df_sub_c5 = df_sub_all[df_sub_all["Curso_Tag"] == curso_5]
         subjects_5 = sorted(df_sub_c5["Subject_Clean"].unique().tolist())
         subj_5 = c2.selectbox("Ano / Subject", subjects_5, key="r5_subj")
+        src_note_5 = build_source_note(df_sub_c5)
 
         ce1, ce2 = st.columns(2)
         want_pdf_5 = ce1.checkbox("Exportar PDF", value=True, key="r5_pdf")
@@ -521,10 +559,11 @@ with tabs[4]:
             eval_dict_5 = evaluate_student_competences(df_sub_s5, students_5, rules_df)
             df_ger = build_report_5_managerial(eval_dict_5, curso_5, subj_5)
 
+            st.caption(src_note_5)
             st.dataframe(df_ger, use_container_width=True, hide_index=True)
 
             if want_pdf_5 and not df_ger.empty:
-                pdf_b5 = generate_pdf_report_5(df_ger, curso_5, subj_5)
+                pdf_b5 = generate_pdf_report_5(df_ger, curso_5, subj_5, source_note=src_note_5)
                 st.download_button(
                     "⬇️ Baixar PDF — Report Gerencial",
                     data=pdf_b5,
@@ -535,8 +574,9 @@ with tabs[4]:
                 xlsx_b5 = to_excel_bytes({
                     "Gerencial Abaixo Mínimo": (
                         df_ger,
-                        f"RELATÓRIO GERENCIAL — COMPETÊNCIAS ABAIXO DO MÍNIMO ({curso_5})",
+                        f"RELATÓRIO GERENCIAL — COMPETÊNCIAS ABAIXO DO MÍNIMO ({format_course_year_label(curso_5, subj_5)})",
                         f"Curso: {curso_5} | Ano / Subject: {subj_5} | Total de alunos avaliados: {len(students_5)}",
+                        src_note_5,
                     )
                 })
                 st.download_button(
