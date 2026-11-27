@@ -220,25 +220,29 @@ with tabs[0]:
 
         if use_preset and not uc_curso.empty:
             uc_idx = st.selectbox(
-                "Unidade Curricular configurada",
+                "UC de referência para o Report",
                 options=range(len(uc_curso)),
-                format_func=lambda i: f"{uc_curso.loc[i, 'UC / Disciplina']} ({uc_curso.loc[i, 'Data Início']} a {uc_curso.loc[i, 'Data Fim']})",
+                format_func=lambda i: f"{uc_curso.loc[i, 'UC / Disciplina']} ({uc_curso.loc[i, 'Data Início'].strftime('%d-%m-%Y')} a {uc_curso.loc[i, 'Data Fim'].strftime('%d-%m-%Y')})",
             )
             row_uc = uc_curso.loc[uc_idx]
             uc_name = str(row_uc["UC / Disciplina"])
-            dt_ini = row_uc["Data Início"]
-            dt_fim = row_uc["Data Fim"]
+            dt_ini_default = row_uc["Data Início"]
+            dt_fim_default = row_uc["Data Fim"]
             sp_default = [s.strip() for s in str(row_uc["Espécies"]).split(",") if s.strip() in ALL_SPECIES]
             act_default = [a.strip() for a in str(row_uc["Atividades"]).split(",") if a.strip() in all_activities_avail]
             subj_default = [str(row_uc["Ano / Subject"]).strip()] if str(row_uc["Ano / Subject"]).strip() in all_subjects_avail else []
         else:
-            uc_name = st.text_input("Nome da Unidade Curricular", value="Unidade Curricular")
-            c1, c2 = st.columns(2)
-            dt_ini = c1.date_input("Data de Início", value=date(2026, 2, 1), key="r1_ini")
-            dt_fim = c2.date_input("Data de Fim", value=date.today(), key="r1_fim")
+            uc_idx = "manual"
+            uc_name = st.text_input("UC de referência para o Report", value="Unidade Curricular")
+            dt_ini_default = date(2026, 2, 1)
+            dt_fim_default = date.today()
             sp_default = list(ALL_SPECIES)
             act_default = all_activities_avail
             subj_default = []
+
+        c_dt1, c_dt2 = st.columns(2)
+        dt_ini = c_dt1.date_input("De (dd-mm-aaaa)", value=dt_ini_default, format="DD-MM-YYYY", key=f"r1_ini_{curso_r1}_{uc_idx}")
+        dt_fim = c_dt2.date_input("Até (dd-mm-aaaa)", value=dt_fim_default, format="DD-MM-YYYY", key=f"r1_fim_{curso_r1}_{uc_idx}")
 
         col_f1, col_f2, col_f3 = st.columns(3)
         sel_subjects = col_f1.multiselect("Ano / Subject (opcional)", all_subjects_avail, default=subj_default, key="r1_subj")
