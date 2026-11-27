@@ -272,7 +272,7 @@ with tabs[0]:
                 f"**Resumo da Extração:** `{meta_uc['logs_approved']}` logs *Approved* | "
                 f"`{meta_uc['logs_da']}` registos *Approved como DA*"
             )
-            st.dataframe(res_uc, use_container_width=True, hide_index=True)
+            st.dataframe(res_uc, width="stretch", hide_index=True)
 
             safe_uc = uc_name.replace(" ", "_")[:30]
             if want_pdf_1:
@@ -333,7 +333,7 @@ with tabs[1]:
                 df_app_all, perfil="MONITOR", ref_date=ref_dt_2, grace_days=int(grace_2)
             )
             st.caption(src_note_2)
-            st.dataframe(df_mon, use_container_width=True, hide_index=True)
+            st.dataframe(df_mon, width="stretch", hide_index=True)
 
             if want_pdf_2:
                 pdf_b2 = generate_pdf_report_2_3(
@@ -395,7 +395,7 @@ with tabs[2]:
                 df_app_all, perfil="TEACHER", ref_date=ref_dt_3, grace_days=int(grace_3)
             )
             st.caption(src_note_3)
-            st.dataframe(df_prof, use_container_width=True, hide_index=True)
+            st.dataframe(df_prof, width="stretch", hide_index=True)
 
             if want_pdf_3:
                 pdf_b3 = generate_pdf_report_2_3(
@@ -482,7 +482,7 @@ with tabs[3]:
                     df_preview = df_preview[df_preview["Status"] == "Abaixo do Mínimo"]
                 st.caption(src_note_4)
                 st.caption(f"Pré-visualização: **{first_st}** ({len(df_preview)} linhas)")
-                st.dataframe(df_preview, use_container_width=True, hide_index=True)
+                st.dataframe(df_preview, width="stretch", hide_index=True)
 
                 if want_pdf_4:
                     if len(target_students_4) == 1:
@@ -560,7 +560,7 @@ with tabs[4]:
             df_ger = build_report_5_managerial(eval_dict_5, curso_5, subj_5)
 
             st.caption(src_note_5)
-            st.dataframe(df_ger, use_container_width=True, hide_index=True)
+            st.dataframe(df_ger, width="stretch", hide_index=True)
 
             if want_pdf_5 and not df_ger.empty:
                 pdf_b5 = generate_pdf_report_5(df_ger, curso_5, subj_5, source_note=src_note_5)
@@ -601,7 +601,7 @@ with tabs[5]:
     uc_edited = st.data_editor(
         uc_current,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Curso": st.column_config.SelectboxColumn("Curso", options=["MIMV", "LEV", "LCB"], required=True),
             "Data Início": st.column_config.DateColumn("Data Início", format="DD/MM/YYYY"),
@@ -624,7 +624,7 @@ with tabs[5]:
     rules_edited = st.data_editor(
         rules_current,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Estado": st.column_config.SelectboxColumn(
                 "Estado",
