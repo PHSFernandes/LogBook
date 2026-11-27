@@ -179,13 +179,13 @@ def prepare_clinical_activities(df_raw: pd.DataFrame, curso_tag: str, source_fil
 
 def prepare_approval_control(df_raw: pd.DataFrame, curso_tag: str, source_filename: str = "") -> pd.DataFrame:
     """
-    Normaliza approval-control eliminando falsos positivos e dupla contagem:
-    1. Exige Estado do Log == 'AWAITING_APPROVAL' (exclui APPROVED, REJECTED, FILLING).
-    2. Avalia o fluxo por Código do Log:
-       - Se existir linha MONITOR com Aprovado vazio (NaN): pendência exclusiva do MONITOR.
-       - Se NÃO existir MONITOR (sem_monitor) OU se o MONITOR já tiver avaliado (Aprovado == 1.0 ou 0.0,
-         equivalente a conform_monitor / non_conform_monitor) E o TEACHER tiver Aprovado vazio (NaN):
-         pendência exclusiva do TEACHER.
+    Normaliza approval-control suportando o layout atual de 1 linha por log
+    (com colunas 'Status de aprovação' e 'Sub-aprovador (Monitor)') e mantendo
+    retrocompatibilidade com exportações antigas:
+    - Pendente Monitor: Sub-aprovador (Monitor) preenchido E Status de aprovação == 'awaiting_approval'.
+    - Pendente Professor: (Sem monitor E Status == 'awaiting_approval')
+                          OU Status in ('conform_monitor', 'non_conform_monitor').
+    - Exclui 'approved', 'rejected' e qualquer registo com Estado do Log != 'AWAITING_APPROVAL'.
     """
     df = clean_columns(df_raw)
     ext_dt, ext_str = extract_date_from_filename(source_filename)
@@ -199,17 +199,40 @@ def prepare_approval_control(df_raw: pd.DataFrame, curso_tag: str, source_filena
     if df_aw.empty:
         return pd.DataFrame(columns=list(df.columns) + ["Perfil_Norm", "Nome_Aprovador_Clean", "Solicitado_Dt"])
 
-    df_aw["Perfil_Norm"] = df_aw["Perfil do Aprovador"].fillna("").astype(str).str.strip().str.upper()
-    df_aw["Nome_Aprovador_Clean"] = df_aw["Nome do Aprovador"].fillna("Sem Nome Atribuído").astype(str).str.strip()
     df_aw["Solicitado_Dt"] = parse_dt_series(df_aw["Solicitado para Aprovação em"])
 
-    # Logs onde há monitor atribuído e ainda sem parecer (Aprovado isna)
+    # Layout novo (1 linha por log com colunas 'Sub-aprovador (Monitor)' e 'Status de aprovação')
+    if "Sub-aprovador (Monitor)" in df_aw.columns and "Status de aprovação" in df_aw.columns:
+        mon_col = df_aw["Sub-aprovador (Monitor)"].fillna("").astype(str).str.strip()
+        sem_monitor = (mon_col == "") | (mon_col.str.lower() == "nan")
+        status_aprov = df_aw["Status de aprovação"].fillna("").astype(str).str.strip().str.lower()
+
+        # 1. Pendente com o Monitor
+        mask_mon = (~sem_monitor) & (status_aprov == "awaiting_approval")
+        mon_pending = df_aw[mask_mon].copy()
+        mon_pending["Perfil_Norm"] = "MONITOR"
+        mon_pending["Nome_Aprovador_Clean"] = mon_col[mask_mon]
+
+        # 2. Pendente com o Professor (sem monitor em awaiting_approval OU já avaliado pelo monitor)
+        mask_prof = (sem_monitor & (status_aprov == "awaiting_approval")) | (
+            status_aprov.isin(["conform_monitor", "non_conform_monitor"])
+        )
+        prof_pending = df_aw[mask_prof].copy()
+        prof_pending["Perfil_Norm"] = "TEACHER"
+        prof_pending["Nome_Aprovador_Clean"] = (
+            prof_pending["Nome do Aprovador"].fillna("Sem Nome Atribuído").astype(str).str.strip()
+        )
+
+        return pd.concat([mon_pending, prof_pending], ignore_index=True)
+
+    # Retrocompatibilidade com layout antigo (2 linhas por log: MONITOR e TEACHER)
+    df_aw["Perfil_Norm"] = df_aw["Perfil do Aprovador"].fillna("").astype(str).str.strip().str.upper()
+    df_aw["Nome_Aprovador_Clean"] = df_aw["Nome do Aprovador"].fillna("Sem Nome Atribuído").astype(str).str.strip()
+
     mon_rows = df_aw[df_aw["Perfil_Norm"] == "MONITOR"].copy()
     mon_pending_rows = mon_rows[mon_rows["Aprovado"].isna()].copy()
     logs_blocked_by_monitor = set(mon_pending_rows["Código do Log"].dropna().unique())
 
-    # Logs pendentes com docente: Estado == AWAITING_APPROVAL, Aprovado docente vazio,
-    # e NÃO bloqueados na fila do monitor (ou seja: sem monitor OU monitor já validou 1.0/0.0)
     tea_rows = df_aw[df_aw["Perfil_Norm"] == "TEACHER"].copy()
     tea_pending_rows = tea_rows[
         tea_rows["Aprovado"].isna() & (~tea_rows["Código do Log"].isin(logs_blocked_by_monitor))
